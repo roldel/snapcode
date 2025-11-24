@@ -1,0 +1,266 @@
+#!/bin/sh
+# snapcode — create an LLM-friendly text snapshot of your codebase.
+#
+# Features:
+# - Prints full directory tree (uses `tree` if available, else fallback)
+# - Respects .gitignore and custom ignore files (gitignore syntax)
+# - Accepts multiple --ignore <RULEFILE> (repeatable)
+# - Optional inclusion of root .gitignore when using custom ignores
+# - Works inside or outside a git repo
+# - Skips itself and the output file to prevent loops
+# - Explicitly includes .env.sample / .env.example files
+# - Avoids symlink directory loops
+# - Safety prompt when dumping without any ignore rules
+# - Skips .git directory from tree and contents
+# - Skips the output file in both tree and contents
+#
+# Requirements: POSIX sh • git (recommended) • tree (optional)
+
+set -e
+
+# -------- Defaults --------
+ROOT="$(pwd)"
+OUTPUT_FILE="$ROOT/snapshot_report.txt"
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+
+# Ignore control
+IGNORE_FILES=""           # space-separated list from --ignore
+INCLUDE_ROOT_GITIGNORE=0
+NO_IGNORE=0
+ASSUME_YES=0
+
+print_usage() {
+    cat <<'EOF'
+Usage: snapcode [options]
+
+Options:
+  --path <DIR>                 Snapshot starting from this directory (default: current)
+  --output <FILE>              Write report to this file (default: <DIR>/snapshot_report.txt)
+                               Use "-" to output to stdout
+
+  --ignore <RULEFILE>          Add ignore file (gitignore syntax). Repeatable.
+  --include-root-gitignore     Also respect <DIR>/.gitignore when using custom ignores
+
+  --no-ignore                  Disable all filtering (full dump, skips safety prompt)
+  --yes                        Auto-answer yes to prompts (non-interactive)
+
+  -h, --help                   Show this help
+
+Examples:
+  snapcode .
+  snapcode --path ./my-app --output context.txt
+  snapcode --ignore .gitignore --ignore ~/.config/llm-ignore
+  snapcode --no-ignore --yes > full_dump.txt
+EOF
+}
+
+# -------- Parse arguments --------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --path)
+            [ $# -ge 2 ] || { echo "Error: --path requires a directory" >&2; exit 1; }
+            ROOT="$2"; shift 2 ;;
+        --output)
+            [ $# -ge 2 ] || { echo "Error: --output requires a file" >&2; exit 1; }
+            OUTPUT_FILE="$2"; shift 2 ;;
+        --ignore)
+            [ $# -ge 2 ] || { echo "Error: --ignore requires a file" >&2; exit 1; }
+            IGNORE_FILES="${IGNORE_FILES}${IGNORE_FILES:+ }$2"; shift 2 ;;
+        --include-root-gitignore)
+            INCLUDE_ROOT_GITIGNORE=1; shift ;;
+        --no-ignore)
+            NO_IGNORE=1; shift ;;
+        --yes)
+            ASSUME_YES=1; shift ;;
+        -h|--help)
+            print_usage; exit 0 ;;
+        --) shift; break ;;
+        -*)
+            echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+# -------- Normalize paths --------
+if ! ROOT="$(cd "$ROOT" 2>/dev/null && pwd)"; then
+    echo "Error: Invalid --path: $ROOT" >&2; exit 1
+fi
+
+case "$OUTPUT_FILE" in
+    /*) : ;;
+    -)  OUTPUT_FILE="-" ;;
+    *)  OUTPUT_FILE="$ROOT/$OUTPUT_FILE" ;;
+esac
+
+# -------- Ignore handling --------
+TMP_IGNORE=""
+cleanup() { [ -n "$TMP_IGNORE" ] && [ -f "$TMP_IGNORE" ] && rm -f "$TMP_IGNORE"; }
+trap cleanup EXIT INT TERM
+
+combine_ignores() {
+    TMP_IGNORE="$(mktemp || mktemp -t snapcode_ignore.XXXXXX)"
+    : > "$TMP_IGNORE"
+    for f in $IGNORE_FILES; do
+        [ -f "$f" ] && cat "$f" >> "$TMP_IGNORE" && echo >> "$TMP_IGNORE"
+    done
+    if [ "$INCLUDE_ROOT_GITIGNORE" -eq 1 ] && [ -f "$ROOT/.gitignore" ]; then
+        cat "$ROOT/.gitignore" >> "$TMP_IGNORE"
+        echo >> "$TMP_IGNORE"
+    fi
+}
+
+USE_IGNORE=0
+USE_CUSTOM=0
+USE_GIT_DEFAULT=0
+
+if [ "$NO_IGNORE" -eq 0 ]; then
+    if [ -n "$IGNORE_FILES" ]; then
+        combine_ignores
+        [ -s "$TMP_IGNORE" ] && USE_IGNORE=1 && USE_CUSTOM=1
+    elif [ -f "$ROOT/.gitignore" ]; then
+        USE_IGNORE=1
+        USE_GIT_DEFAULT=1
+    fi
+fi
+
+# -------- Safety prompt --------
+if [ "$USE_IGNORE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ "$NO_IGNORE" -eq 0 ]; then
+    echo "Warning: No ignore rules active → this will dump EVERY file."
+    printf "Continue? [y/N] "
+    read -r ans
+    case "$ans" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac
+fi
+
+# -------- Start output --------
+if [ "$OUTPUT_FILE" = "-" ]; then
+    exec > /dev/stdout
+else
+    exec > "$OUTPUT_FILE"
+fi
+
+{
+    echo "===== snapcode Report ====="
+    echo "Root: $ROOT"
+    echo "Generated: $(date)"
+    if [ "$USE_IGNORE" -eq 1 ]; then
+        [ "$USE_CUSTOM" -eq 1 ] && echo "Ignore: custom rules" || echo "Ignore: root .gitignore"
+    else
+        echo "Ignore: none (full dump)"
+    fi
+    echo
+} 
+
+# -------- Directory tree --------
+cd "$ROOT"
+echo "===== Directory Tree ====="
+
+OUT_BASE=""
+OUT_REL=""
+if [ "$OUTPUT_FILE" != "-" ]; then
+    OUT_BASE="$(basename "$OUTPUT_FILE")"
+    case "$OUTPUT_FILE" in
+        "$ROOT"/*)
+            OUT_REL="${OUTPUT_FILE#$ROOT/}"
+            ;;
+        *)
+            OUT_REL=""
+            ;;
+    esac
+fi
+
+if command -v tree >/dev/null 2>&1; then
+    # Exclude .git directory from the tree listing and, if applicable, the output file
+    if [ -n "$OUT_BASE" ]; then
+        # tree doesn't support multiple -I well everywhere, so filter the output file via sed
+        tree -a --dirsfirst -I '.git' | sed "/[[:space:]]$OUT_BASE\$/d"
+    else
+        tree -a --dirsfirst -I '.git'
+    fi
+else
+    echo "(tree not available — using find fallback)"
+    if [ -n "$OUT_REL" ]; then
+        # Prune .git and the output file path if it's inside ROOT
+        find . \
+            -path './.git' -prune -o \
+            -path "./$OUT_REL" -prune -o \
+            -print \
+        | sed -e 's;[^/]*/;│   ;g;s;│   \([^│ ]\);├── \1;'
+    else
+        # Only prune .git
+        find . -path './.git' -prune -o -print \
+        | sed -e 's;[^/]*/;│   ;g;s;│   \([^│ ]\);├── \1;'
+    fi
+fi
+echo
+
+# -------- File contents --------
+is_ignored() {
+    [ "$USE_IGNORE" -eq 0 ] && return 1
+    command -v git >/dev/null 2>&1 || return 1
+    if [ "$USE_CUSTOM" -eq 1 ]; then
+        git -c core.excludesFile="$TMP_IGNORE" check-ignore --no-index -q -- "$1" 2>/dev/null
+    else  # USE_GIT_DEFAULT
+        git check-ignore -q -- "$1" 2>/dev/null || git check-ignore --no-index -q -- "$1" 2>/dev/null
+    fi
+}
+
+append_file() {
+    file="$1"
+    real_file="$(realpath "$file" 2>/dev/null || echo "$file")"
+    real_script="$(realpath "$SCRIPT_PATH" 2>/dev/null || echo "$SCRIPT_PATH")"
+    real_output="$(realpath "$OUTPUT_FILE" 2>/dev/null || echo "$OUTPUT_FILE")"
+
+    # Skip self and output file
+    [ "$real_file" = "$real_script" ] && return
+    [ "$real_file" = "$real_output" ] && return
+    [ "$OUTPUT_FILE" = "-" ] && [ "$real_file" = "$real_output" ] && return
+
+    # Hard-skip anything under a .git directory, just in case
+    case "$file" in
+        */.git|*/.git/*|.git|.git/*) return ;;
+    esac
+
+    # Respect ignore rules
+    if is_ignored "$file"; then return; fi
+
+    echo "===== File: $file ====="
+    cat "$file" 2>/dev/null || echo "[Error: could not read file]"
+    echo
+    echo
+}
+
+print_contents() {
+    dir="$1"
+
+    # Explicitly include sample env files (even if they might otherwise be ignored)
+    for sample in "$dir"/.env.sample "$dir"/.env.example; do
+        [ -f "$sample" ] && append_file "$sample"
+    done
+
+    for item in "$dir"/*; do
+        # If the glob didn't match anything, skip the literal "$dir/*"
+        [ -e "$item" ] || [ -L "$item" ] || continue
+
+        # Skip .git directory entirely
+        if [ -d "$item" ] && [ "$(basename "$item")" = ".git" ]; then
+            continue
+        fi
+
+        if [ -d "$item" ]; then
+            # Skip symlinked dirs to avoid loops
+            [ -L "$item" ] && continue
+            print_contents "$item"
+        elif [ -f "$item" ]; then
+            append_file "$item"
+        fi
+    done
+}
+
+echo "===== File Contents ====="
+echo
+print_contents "$ROOT"
+
+# -------- Done --------
+if [ "$OUTPUT_FILE" != "-" ]; then
+    echo "Done! Snapshot saved to: $OUTPUT_FILE"
+fi
