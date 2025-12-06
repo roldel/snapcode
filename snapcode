@@ -5,9 +5,11 @@ set -e
 
 # -------- Defaults --------
 ORIGINAL_CWD="$(pwd)"              # Where the command is run from
-ROOT="$ORIGINAL_CWD"               # Default target is current dir
 OUTPUT_FILE="snapshot_report.txt"  # Default filename
 SCRIPT_PATH="$0"
+
+# Target collection (newline separated string)
+TARGETS=""
 
 # Ignore control
 IGNORE_FILES=""
@@ -17,15 +19,15 @@ ASSUME_YES=0
 
 print_usage() {
     cat <<'EOF'
-Usage: snapcode [options] [directory]
+Usage: snapcode [options] [directories...]
 
 Options:
-  --path <DIR>                 Snapshot starting from this directory (default: current)
+  --path <DIR>                 Add a directory to snapshot (can be repeated)
   --output <FILE>              Write report to this file (default: ./snapshot_report.txt)
                                Use "-" to output to stdout
 
   --ignore <RULEFILE>          Add ignore file (gitignore syntax). Repeatable.
-  --include-root-gitignore     Also respect <DIR>/.gitignore when using custom ignores
+  --include-root-gitignore     Also respect .gitignore in the current directory
 
   --no-ignore                  Disable all filtering (full dump, skips safety prompt)
   --yes                        Auto-answer yes to prompts (non-interactive)
@@ -33,9 +35,21 @@ Options:
   -h, --help                   Show this help
 
 Examples:
-  snapcode src/lib
-  snapcode --output context.txt src/lib
+  snapcode src/lib src/utils
+  snapcode --path backend --path frontend --output full_stack.txt
 EOF
+}
+
+# -------- Helper to add targets --------
+add_target() {
+    # Normalize path immediately
+    if [ -d "$1" ]; then
+        ABS_PATH="$(cd "$1" 2>/dev/null && pwd)"
+        TARGETS="$TARGETS$ABS_PATH
+"
+    else
+        echo "Error: Invalid path: $1" >&2; exit 1
+    fi
 }
 
 # -------- Parse arguments --------
@@ -43,7 +57,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --path)
             [ $# -ge 2 ] || { echo "Error: --path requires a directory" >&2; exit 1; }
-            ROOT="$2"; shift 2 ;;
+            add_target "$2"; shift 2 ;;
         --output)
             [ $# -ge 2 ] || { echo "Error: --output requires a file" >&2; exit 1; }
             OUTPUT_FILE="$2"; shift 2 ;;
@@ -58,26 +72,27 @@ while [ $# -gt 0 ]; do
             ASSUME_YES=1; shift ;;
         -h|--help)
             print_usage; exit 0 ;;
-        --) shift; break ;;
+        --) shift; break ;; # Stop parsing flags, rest are targets
         -*)
             echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
-        *) break ;;
+        *) 
+            # Treat positional argument as a target
+            add_target "$1"; shift ;;
     esac
 done
 
-# -------- Handle Positional Argument --------
-# If a directory is provided without --path, use it
-if [ $# -gt 0 ]; then
-    ROOT="$1"
-fi
+# If arguments remain after '--', add them
+for arg in "$@"; do
+    add_target "$arg"
+done
 
-# -------- Normalize Target Path (ROOT) --------
-if ! ROOT="$(cd "$ROOT" 2>/dev/null && pwd)"; then
-    echo "Error: Invalid path: $ROOT" >&2; exit 1
+# Default to current directory if no targets specified
+if [ -z "$TARGETS" ]; then
+    add_target "."
 fi
 
 # -------- Resolve Output Path --------
-# If path is relative, anchor it to ORIGINAL_CWD, not ROOT
+# If path is relative, anchor it to ORIGINAL_CWD
 case "$OUTPUT_FILE" in
     /*) : ;; # Absolute path, do nothing
     -)  OUTPUT_FILE="-" ;;
@@ -100,96 +115,57 @@ combine_ignores() {
     for f in $IGNORE_FILES; do
         [ -f "$f" ] && cat "$f" >> "$TMP_IGNORE" && echo >> "$TMP_IGNORE"
     done
-    if [ "$INCLUDE_ROOT_GITIGNORE" -eq 1 ] && [ -f "$ROOT/.gitignore" ]; then
-        cat "$ROOT/.gitignore" >> "$TMP_IGNORE"
+    # Use ORIGINAL_CWD for the root gitignore check since we might have multiple roots
+    if [ "$INCLUDE_ROOT_GITIGNORE" -eq 1 ] && [ -f "$ORIGINAL_CWD/.gitignore" ]; then
+        cat "$ORIGINAL_CWD/.gitignore" >> "$TMP_IGNORE"
         echo >> "$TMP_IGNORE"
     fi
 }
 
 USE_IGNORE=0
 USE_CUSTOM=0
-USE_GIT_DEFAULT=0
 
 if [ "$NO_IGNORE" -eq 0 ]; then
     if [ -n "$IGNORE_FILES" ]; then
         combine_ignores
         [ -s "$TMP_IGNORE" ] && USE_IGNORE=1 && USE_CUSTOM=1
-    elif [ -f "$ROOT/.gitignore" ]; then
+    elif [ -f "$ORIGINAL_CWD/.gitignore" ]; then
+        # Fallback to gitignore in current dir if no custom files provided
         USE_IGNORE=1
-        USE_GIT_DEFAULT=1
     fi
 fi
 
 # -------- Safety prompt --------
 if [ "$USE_IGNORE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ "$NO_IGNORE" -eq 0 ]; then
-    echo "Warning: No ignore rules active → this will dump EVERY file in:"
-    echo "  $ROOT"
+    echo "Warning: No ignore rules active → this will dump EVERY file in the targets."
     printf "Continue? [y/N] "
     read -r ans
     case "$ans" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac
 fi
 
-# -------- Generator Function --------
-generate_report() {
-    echo "===== snapcode Report ====="
-    echo "Root: $ROOT"
-    echo "Generated: $(date)"
-    if [ "$USE_IGNORE" -eq 1 ]; then
-        [ "$USE_CUSTOM" -eq 1 ] && echo "Ignore: custom rules" || echo "Ignore: root .gitignore"
-    else
-        echo "Ignore: none (full dump)"
-    fi
-    echo
-
-    # -------- Directory tree --------
-    cd "$ROOT"
-    echo "===== Directory Tree ====="
-    
-    # Check if the output file is physically inside the root we are scanning
-    # If so, we need to hide it from the tree
-    TREE_IGNORE=".git"
-    if [ "$OUTPUT_FILE" != "-" ]; then
-         # Check if OUTPUT_FILE starts with ROOT
-         case "$OUTPUT_FILE" in
-            "$ROOT"*)
-                OUT_BASENAME="$(basename "$OUTPUT_FILE")"
-                TREE_IGNORE="$TREE_IGNORE|$OUT_BASENAME"
-                ;;
-         esac
-    fi
-
-    if command -v tree >/dev/null 2>&1; then
-        tree -a --dirsfirst -I "$TREE_IGNORE"
-    else
-        echo "(tree not available — using find fallback)"
-        find . -path './.git' -prune -o -print \
-        | sed -e 's;[^/]*/;│   ;g;s;│   \([^│ ]\);├── \1;'
-    fi
-    echo
-
-    # -------- File contents --------
-    echo "===== File Contents ====="
-    echo
-    print_contents "$ROOT"
-}
-
+# -------- Check Ignore Function --------
 is_ignored() {
     [ "$USE_IGNORE" -eq 0 ] && return 1
     command -v git >/dev/null 2>&1 || return 1
+    
+    # We always run check-ignore from ORIGINAL_CWD to respect relative paths correctly
+    # or rely on absolute path matching.
     if [ "$USE_CUSTOM" -eq 1 ]; then
-        git -c core.excludesFile="$TMP_IGNORE" check-ignore --no-index -q -- "$1" 2>/dev/null
+        git -C "$ORIGINAL_CWD" -c core.excludesFile="$TMP_IGNORE" check-ignore --no-index -q -- "$1" 2>/dev/null
     else
-        git check-ignore -q -- "$1" 2>/dev/null || git check-ignore --no-index -q -- "$1" 2>/dev/null
+        # Standard git ignore check
+        git -C "$ORIGINAL_CWD" check-ignore -q -- "$1" 2>/dev/null || \
+        git -C "$ORIGINAL_CWD" check-ignore --no-index -q -- "$1" 2>/dev/null
     fi
 }
+
+# -------- Output Helpers --------
 
 append_file() {
     file="$1"
 
-    # CRITICAL FIX: Prevent infinite loop / corruption
+    # Avoid self-reference
     if [ "$OUTPUT_FILE" != "-" ] && [ "$file" -ef "$OUTPUT_FILE" ]; then return; fi
-    
-    # Skip self
     if [ "$file" -ef "$SCRIPT_PATH" ]; then return; fi
 
     case "$file" in
@@ -228,6 +204,65 @@ print_contents() {
         elif [ -f "$item" ]; then
             append_file "$item"
         fi
+    done
+}
+
+process_root() {
+    ROOT="$1"
+    [ -z "$ROOT" ] && return
+
+    echo
+    echo "################################################"
+    echo "# SECTION ROOT: $ROOT"
+    echo "################################################"
+    echo
+
+    # -------- Directory tree --------
+    echo "===== Directory Tree ($ROOT) ====="
+    
+    # Check if the output file is physically inside the root we are scanning
+    TREE_IGNORE=".git"
+    if [ "$OUTPUT_FILE" != "-" ]; then
+         case "$OUTPUT_FILE" in
+            "$ROOT"*)
+                OUT_BASENAME="$(basename "$OUTPUT_FILE")"
+                TREE_IGNORE="$TREE_IGNORE|$OUT_BASENAME"
+                ;;
+         esac
+    fi
+
+    # Run tree from the perspective of the root
+    (
+        cd "$ROOT" || return
+        if command -v tree >/dev/null 2>&1; then
+            tree -a --dirsfirst -I "$TREE_IGNORE"
+        else
+            echo "(tree not available — using find fallback)"
+            find . -path './.git' -prune -o -print \
+            | sed -e 's;[^/]*/;│   ;g;s;│   \([^│ ]\);├── \1;'
+        fi
+    )
+    echo
+
+    # -------- File contents --------
+    echo "===== File Contents ($ROOT) ====="
+    echo
+    print_contents "$ROOT"
+}
+
+generate_report() {
+    echo "===== snapcode Report ====="
+    echo "Generated: $(date)"
+    
+    if [ "$USE_IGNORE" -eq 1 ]; then
+        [ "$USE_CUSTOM" -eq 1 ] && echo "Ignore: custom rules" || echo "Ignore: root .gitignore (auto-detected)"
+    else
+        echo "Ignore: none (full dump)"
+    fi
+
+    # Loop over targets (newline separated string)
+    printf %s "$TARGETS" | while IFS= read -r target; do
+        process_root "$target"
     done
 }
 
