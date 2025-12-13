@@ -1,144 +1,133 @@
-# snapcode
+# 📸 snapcode
 
-Create an LLM‑friendly text snapshot of your codebase in a single file: a directory tree plus the contents of your source files, while respecting ignore rules.
+**Turn your codebase into a single, LLM-friendly text file.**
 
-## What it does
+`snapcode` is a lightweight shell script that creates a snapshot of your project (directory tree + file contents) to share with Large Language Models (ChatGPT, Claude, etc.).
 
-`snapcode` walks your project directory and produces a plaintext report that contains:
+It is designed to be **transparent** and **safe**: it strictly respects your existing `.gitignore` rules and does not hide or exclude files "magically" (other than the `.git` directory and binary files).
 
-- A **directory tree** of your project (using `tree` if available, otherwise a `find` fallback).
-- The **full contents of each file**, one after another, clearly delimited.
-- Respect for **ignore rules** (like `.gitignore` and custom ignore files), so you don’t accidentally dump huge build artifacts, dependencies, or secrets.
-- Automatic skipping of:
-  - The `.git` directory
-  - The `snapcode` script itself
-  - The output report file (to avoid self‑reference loops)
-- Explicit inclusion of `.env.sample` and `.env.example` files, even if they would otherwise be ignored.
+## ✨ Features
 
-This makes it ideal for sharing your codebase context with LLMs, code review tools, or search/indexing systems.
+*   **Strict Ignore Handling:** Respects the `.gitignore` of the target directory. If you haven't ignored a file in git, `snapcode` will include it.
+*   **Performance:** Checks ignore rules *before* recursing into directories (safe for large projects with ignored `node_modules`).
+*   **Binary Safety:** Automatically detects and skips binary files (images, compiled binaries) to keep the text output clean.
+*   **Multi-Folder Support:** Snapshot multiple distinct directories in a single run.
+*   **Portable:** Single-file script. Runs on any POSIX shell (`sh`, `bash`, `zsh`).
 
-## Installation
+## 🚀 Installation
 
-You only need a POSIX shell. `git` is recommended (for ignore handling), and `tree` is optional.
+Download the script and make it executable.
 
-From your project root, download and make it executable:
-
+**Using wget:**
 ```bash
 wget -O snapcode https://github.com/roldel/snapcode/raw/main/snapcode
 chmod +x snapcode
 ```
 
-Or with `curl`:
-
+**Using curl:**
 ```bash
 curl -L https://github.com/roldel/snapcode/raw/main/snapcode -o snapcode
 chmod +x snapcode
 ```
 
-You can keep it in your project root or move it somewhere on your `PATH` (e.g. `~/bin`).
+*Optional: Move it to your path to use it globally:*
+```bash
+mv snapcode /usr/local/bin/snapcode
+```
 
-## Basic usage
+## 📖 Usage
 
-From inside your project:
+### Basic Snapshot
+Run it in your project root. It will generate `snapshot_report.txt`.
 
 ```bash
 ./snapcode
 ```
 
-This will:
-
-- Use the **current directory** as the root.
-- Write the snapshot to `./snapshot_report.txt`.
-- Use the root `.gitignore` (if present) to filter files.
-
-You can change the root and the output file:
+### Snapshot Multiple Folders
+You can create a snapshot that combines different parts of your system. `snapcode` will switch contexts correctly for each folder.
 
 ```bash
-./snapcode --path ./my-app --output context.txt
+./snapcode frontend/src backend/api
 ```
 
-To write the snapshot directly to stdout (e.g. to pipe into another tool):
+### Custom Output
+```bash
+./snapcode --output context.md
+```
+
+### Pipe to Clipboard
+```bash
+./snapcode --output - | pbcopy
+```
+
+## 🛡️ Ignore Rules & Transparency
+
+`snapcode` relies on **your** configuration to keep secrets safe.
+
+1.  **It uses your `.gitignore`:** If you have `.env` inside your `.gitignore`, `snapcode` will skip it.
+2.  **No Magic Hiding:** If you have **not** ignored `.env` (or other secrets), `snapcode` **will dump them**.
+3.  **Safety Stop:** If no ignore rules are detected at all, `snapcode` will pause and ask for confirmation before dumping files.
+
+### Custom Ignore Files
+You can add extra ignore rules just for the snapshot without modifying your project.
 
 ```bash
-./snapcode --output -
+# Apply rules from .llmignore ON TOP of the standard .gitignore
+./snapcode --ignore .llmignore --include-root-gitignore
 ```
 
-## Ignore rules & safety
-
-By default, `snapcode` tries to avoid dumping everything blindly:
-
-- If you don’t specify any `--ignore` files and there is a `.gitignore` in the root, that `.gitignore` is used automatically.
-- If **no** ignore rules are active and you haven’t passed `--no-ignore`, `snapcode` will print a warning and ask for confirmation before dumping every file.
-
-### Custom ignore files
-
-You can supply one or more custom ignore files (using gitignore syntax):
-
-```bash
-./snapcode --ignore .gitignore --ignore ~/.config/llm-ignore
-```
-
-To combine custom ignore files with the root `.gitignore` in the target directory:
-
-```bash
-./snapcode --ignore ~/.config/llm-ignore --include-root-gitignore
-```
-
-### Disabling ignores
-
-If you truly want a full dump:
+### The "Dump Everything" Mode
+To ignore all rules and dump every text file found:
 
 ```bash
 ./snapcode --no-ignore --yes
 ```
 
-- `--no-ignore` disables all filtering.
-- `--yes` auto‑answers “yes” to prompts (useful for non‑interactive usage).
+## ⚙️ Command-Line Options
 
-> **Note:** Even with `--no-ignore`, `snapcode` still skips `.git`, its own script file, and the output report file.
+| Option | Description |
+| :--- | :--- |
+| `--path <DIR>` | Add a directory to the snapshot (optional, can just list dirs). |
+| `--output <FILE>` | File to write to. Use `-` for stdout. |
+| `--ignore <FILE>` | Add a custom ignore file (repeatable). |
+| `--include-root-gitignore` | Merge the current directory's `.gitignore` with custom ignores. |
+| `--no-ignore` | Disable all filtering (dumps everything except .git and the snapshot script itself). |
+| `--yes` | Non-interactive mode (auto-accepts prompts). |
+| `-h, --help` | Show help message. |
 
-## Command‑line options
+## 📦 Requirements
+
+*   **Shell:** Standard `sh` (bash/zsh compatible).
+*   **Git:** Required for accurate ignore checking.
+*   **Grep:** Required for binary file detection.
+*   **Tree:** (Optional) If installed, generates a better visual map.
+
+## 📝 Output Format Example
+
+The generated report is structured to be easily parsed by LLMs:
 
 ```text
---path <DIR>                 Snapshot starting from this directory (default: current)
+===== snapcode Report =====
+Generated: Sat Dec 13 14:00:00 GMT 2025
 
---output <FILE>              Write report to this file (default: <DIR>/snapshot_report.txt) Use "-" to output to stdout
+################################################
+# SECTION ROOT: /my/project
+################################################
 
---ignore <RULEFILE>          Add ignore file (gitignore syntax). Repeatable.
---include-root-gitignore     Also respect <DIR>/.gitignore when using custom ignores
+===== Directory Tree (/my/project) =====
+.
+├── src
+│   ├── main.js
+│   └── utils.js
+└── README.md
 
---no-ignore                  Disable all filtering (full dump, skips safety prompt)
---yes                        Auto-answer yes to prompts (non-interactive)
+===== File Contents (/my/project) =====
 
--h, --help                   Show help
+===== File: src/main.js =====
+console.log("Hello World");
+
+
+===== File: src/utils.js =====
+export const add = (a, b) => a + b;
 ```
-
-## Typical workflows
-
-### 1. Generate a snapshot for a support / LLM session
-
-```bash
-./snapcode --output project_snapshot.txt
-```
-
-Then upload `project_snapshot.txt` to your tool / chat for analysis.
-
-### 2. Use a custom global ignore file
-
-```bash
-./snapcode --ignore .gitignore --ignore ~/.config/llm-ignore --output context.txt
-```
-
-### 3. Pipe into another process
-
-```bash
-./snapcode --output - | some-other-tool
-```
-
-## Requirements & compatibility
-
-- **Shell:** POSIX `sh`
-- **Recommended:** `git` (for ignore handling)
-- **Optional:** `tree` (for a nicer directory tree view). If `tree` is missing, `snapcode` falls back to `find`.
-
-`snapcode` is designed to be self‑contained and portable: just one script, no external Python/Node/whatever dependencies.
