@@ -1,0 +1,498 @@
+#!/bin/sh
+# snapcode — create an LLM-friendly text snapshot of your codebase.
+
+set -e
+
+# -------- Version --------
+VERSION="1.3.0"
+
+# -------- Configuration --------
+ORIGINAL_CWD="$(pwd)"
+OUTPUT_FILE="snapcode.txt"
+
+# Resolve script's real path, following symlinks, for self-exclusion
+if command -v readlink >/dev/null 2>&1; then
+    SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+else
+    SCRIPT_PATH="$0"
+fi
+
+# Targets stored in a temp file (newline-safe for typical paths; avoids
+# the variable-with-embedded-newlines corruption issue)
+TMP_TARGETS=""
+TMP_IGNORE_FILES=""
+TMP_IGNORE=""
+TMP_OUTPUT=""
+
+# Flags
+NO_IGNORE=0
+ASSUME_YES=0
+
+# Stats counters
+_STAT_FILES=0
+_STAT_BINARY=0
+
+# -------- Usage --------
+print_usage() {
+    cat <<'EOF'
+Usage: snapcode [options] [paths...]
+
+Options:
+  --path <PATH>                Add a file or directory to snapshot (can be repeated)
+  --output <FILE>              Write report to this file (default: ./snapcode.txt)
+                               Use "-" to output to stdout
+
+  --ignore <RULEFILE>          Add custom ignore file (standard gitignore syntax)
+  --include-root-gitignore     Also respect .gitignore in the current working
+                               directory, in addition to each target's own rules.
+                               Useful when the CWD differs from the snapshot target.
+
+  --no-ignore                  Disable all filtering (dumps everything except .git;
+                               binary files are still skipped)
+  --yes                        Auto-answer yes to prompts
+
+  --version                    Print version and exit
+  -h, --help                   Show this help
+
+Description:
+  snapcode generates a text snapshot of your code for sharing with LLMs.
+
+  Ignore rules: each target directory's own .gitignore is always respected
+  automatically (via git check-ignore). Use --include-root-gitignore if the
+  current working directory has additional rules you want applied on top.
+
+  Binary files are detected and skipped. The .git directory is always excluded.
+EOF
+}
+
+# -------- Cleanup --------
+cleanup() {
+    [ -n "$TMP_TARGETS" ]      && [ -f "$TMP_TARGETS" ]      && rm -f "$TMP_TARGETS"
+    [ -n "$TMP_IGNORE_FILES" ] && [ -f "$TMP_IGNORE_FILES" ] && rm -f "$TMP_IGNORE_FILES"
+    [ -n "$TMP_IGNORE" ]       && [ -f "$TMP_IGNORE" ]       && rm -f "$TMP_IGNORE"
+    [ -n "$TMP_OUTPUT" ]       && [ -f "$TMP_OUTPUT" ]       && rm -f "$TMP_OUTPUT"
+}
+trap cleanup EXIT INT TERM
+
+# -------- mktemp portable wrapper --------
+_make_temp_counter=0
+make_temp() {
+    _make_temp_counter=$(( _make_temp_counter + 1 ))
+    mktemp 2>/dev/null \
+        || mktemp -t "snapcode.XXXXXX" 2>/dev/null \
+        || { t="/tmp/snapcode.$$.${_make_temp_counter}"; : > "$t" && echo "$t"; }
+}
+
+# Initialise temp files immediately
+TMP_TARGETS="$(make_temp)"
+TMP_IGNORE_FILES="$(make_temp)"
+
+# -------- Helper to add targets --------
+add_target() {
+    if [ -d "$1" ]; then
+        ABS_PATH="$(cd "$1" 2>/dev/null && pwd)"
+        printf '%s\n' "$ABS_PATH" >> "$TMP_TARGETS"
+    elif [ -f "$1" ]; then
+        dir="$(dirname "$1")"
+        file="$(basename "$1")"
+        ABS_PATH="$(cd "$dir" 2>/dev/null && pwd)/$file"
+        printf '%s\n' "$ABS_PATH" >> "$TMP_TARGETS"
+    else
+        echo "Error: Invalid path: $1" >&2
+        exit 1
+    fi
+}
+
+# -------- Parse arguments --------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --path)
+            [ $# -ge 2 ] || { echo "Error: --path requires a file or directory" >&2; exit 1; }
+            add_target "$2"; shift 2 ;;
+        --output)
+            [ $# -ge 2 ] || { echo "Error: --output requires a file" >&2; exit 1; }
+            OUTPUT_FILE="$2"; shift 2 ;;
+        --ignore)
+            [ $# -ge 2 ] || { echo "Error: --ignore requires a file" >&2; exit 1; }
+            printf '%s\n' "$2" >> "$TMP_IGNORE_FILES"; shift 2 ;;
+        --include-root-gitignore)
+            INCLUDE_ROOT_GITIGNORE=1; shift ;;
+        --no-ignore)
+            NO_IGNORE=1; shift ;;
+        --yes)
+            ASSUME_YES=1; shift ;;
+        --version)
+            echo "snapcode $VERSION"; exit 0 ;;
+        -h|--help)
+            print_usage; exit 0 ;;
+        --) shift; break ;;
+        -*)
+            echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
+        *)
+            add_target "$1"; shift ;;
+    esac
+done
+
+for arg in "$@"; do add_target "$arg"; done
+
+# Default to current directory if no targets given
+if [ ! -s "$TMP_TARGETS" ]; then add_target "."; fi
+
+# -------- Resolve Output Path --------
+case "$OUTPUT_FILE" in
+    /*) : ;;
+    -)  OUTPUT_FILE="-" ;;
+    *)  OUTPUT_FILE="$ORIGINAL_CWD/$OUTPUT_FILE" ;;
+esac
+
+# -------- Early Dependency Check --------
+# git is required for all ignore handling. Fail loudly rather than silently
+# dumping files the user expects to be filtered.
+if [ "$NO_IGNORE" -eq 0 ] && ! command -v git >/dev/null 2>&1; then
+    echo "Error: git is required for ignore handling." >&2
+    echo "Install git, or use --no-ignore --yes to snapshot without filtering." >&2
+    exit 1
+fi
+
+# -------- Ignore Logic --------
+INCLUDE_ROOT_GITIGNORE="${INCLUDE_ROOT_GITIGNORE:-0}"
+
+combine_ignores() {
+    TMP_IGNORE="$(make_temp)"
+    while IFS= read -r f; do
+        [ -f "$f" ] && cat "$f" >> "$TMP_IGNORE" && echo >> "$TMP_IGNORE"
+    done < "$TMP_IGNORE_FILES"
+    if [ "$INCLUDE_ROOT_GITIGNORE" -eq 1 ] && [ -f "$ORIGINAL_CWD/.gitignore" ]; then
+        cat "$ORIGINAL_CWD/.gitignore" >> "$TMP_IGNORE"
+        echo >> "$TMP_IGNORE"
+    fi
+}
+
+USE_CUSTOM=0
+if [ -s "$TMP_IGNORE_FILES" ] || [ "$INCLUDE_ROOT_GITIGNORE" -eq 1 ]; then
+    combine_ignores
+    [ -s "$TMP_IGNORE" ] && USE_CUSTOM=1
+fi
+
+# -------- Safety Prompt --------
+# A target is only considered "safe" (ignore rules will actually be applied) if
+# it lives inside a git worktree. A bare .gitignore with no .git/ is NOT enough
+# because is_ignored() requires git check-ignore to apply the rules. Treating a
+# bare .gitignore as safe would suppress the warning while still dumping secrets.
+if [ "$NO_IGNORE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ "$USE_CUSTOM" -eq 0 ]; then
+    IS_SAFE=0
+
+    while IFS= read -r target; do
+        [ -z "$target" ] && continue
+        target_dir="$target"
+        [ -f "$target" ] && target_dir="$(dirname "$target")"
+
+        if git -C "$target_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            IS_SAFE=1
+            break
+        fi
+    done < "$TMP_TARGETS"
+
+    if [ "$IS_SAFE" -eq 0 ]; then
+        echo "Warning: No git repository detected in the target path(s)."
+        echo "Ignore rules require a git worktree — files will NOT be filtered."
+        echo "This will dump EVERY file in the target paths (binary files are still skipped)."
+        printf "Continue? [y/N] "
+        read -r ans
+        case "$ans" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac
+    fi
+fi
+
+# -------- Checks --------
+
+is_ignored() {
+    _path="$1"
+
+    # 1. Hard exclusions — always skip .git
+    case "$_path" in
+        */.git|*/.git/*|.git|.git/*) return 0 ;;
+    esac
+
+    # Self-exclusion: skip the output file and any in-progress temp output.
+    if [ "$OUTPUT_FILE" != "-" ]; then
+        if [ -f "$OUTPUT_FILE" ] && [ "$_path" -ef "$OUTPUT_FILE" ]; then
+            return 0
+        fi
+        if [ -n "$TMP_OUTPUT" ] && [ -f "$TMP_OUTPUT" ] && [ "$_path" -ef "$TMP_OUTPUT" ]; then
+            return 0
+        fi
+    fi
+
+    # Skip the script itself (resolved real path handles symlinked installs)
+    if [ -f "$SCRIPT_PATH" ] && [ "$_path" -ef "$SCRIPT_PATH" ]; then return 0; fi
+
+    # 2. No-ignore mode — include everything (except .git above)
+    [ "$NO_IGNORE" -eq 1 ] && return 1
+
+    # 3. Custom / combined ignore rules
+    if [ "$USE_CUSTOM" -eq 1 ]; then
+        git -C "$ORIGINAL_CWD" -c core.excludesFile="$TMP_IGNORE" check-ignore --no-index -q -- "$_path" 2>/dev/null && return 0
+    fi
+
+    # 4. Standard git ignore — context-aware per file/directory location
+    if [ -d "$_path" ]; then
+        _dir_context="$_path"
+    else
+        _dir_context="$(dirname "$_path")"
+    fi
+
+    if git -C "$_dir_context" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "$_dir_context" check-ignore -q -- "$_path" 2>/dev/null && return 0
+    fi
+
+    return 1
+}
+
+# Binary detection. Strategy: try grep -I first (GNU/BSD); if that exits with
+# status 2 (unrecognised option, e.g. BusyBox) fall back to od/tr null-byte checks.
+#
+# IMPORTANT: grep -Iq returns 1 for binary files, which would trigger set -e if
+# called as a bare statement. Use if/else to handle exit codes explicitly.
+#
+# Variable naming note: _nonprint_size is the count of bytes *removed* by
+# `tr -d [:print:][:space:]` — i.e. non-printable bytes. If that count exceeds
+# 10% of total file size, the file is treated as binary.
+is_binary() {
+    _f="$1"
+    [ -s "$_f" ] || return 1   # empty files are not binary
+
+    # Attempt grep -I (GNU/BSD grep): exits 0 = text, 1 = binary, 2 = bad option.
+    # Must use if/else — a bare call with exit code 1 would trigger set -e.
+    # Use ^ rather than . as the pattern: . doesn't match newlines, so a file
+    # containing only newlines (e.g. .gitkeep) would be falsely flagged as binary.
+    if grep -Iq '^' "$_f" 2>/dev/null; then
+        return 1   # text
+    else
+        _grep_status=$?
+        if [ "$_grep_status" -eq 1 ]; then return 0; fi   # binary
+        # _grep_status eq 2 → option not recognised (BusyBox); fall through
+    fi
+
+    # od fallback: look for a null byte in the first 1KB.
+    # Sampling avoids freezing on large binary files (ISOs, database dumps, etc).
+    if command -v od >/dev/null 2>&1; then
+        dd if="$_f" bs=1024 count=1 2>/dev/null \
+            | od -An -tx1 2>/dev/null | tr -d ' \n' | grep -q '00' && return 0
+    fi
+
+    # tr fallback: count non-printable bytes in first 1KB; treat as binary if >10%
+    if command -v tr >/dev/null 2>&1; then
+        _orig_size=$(dd if="$_f" bs=1024 count=1 2>/dev/null | wc -c)
+        _nonprint_size=$(dd if="$_f" bs=1024 count=1 2>/dev/null \
+            | tr -d '[:print:][:space:]' 2>/dev/null | wc -c)
+        [ "$(( _nonprint_size * 10 ))" -gt "$_orig_size" ] && return 0
+    fi
+
+    return 1   # assume text if all checks inconclusive
+}
+
+# -------- Processing --------
+
+append_file() {
+    _file="$1"
+
+    is_ignored "$_file" && return
+
+    # Skip symlinks — following them can leak files outside the project tree.
+    # Note the symlink in the output so the user knows it was seen but skipped.
+    if [ -L "$_file" ]; then
+        echo "===== Symlink: $_file -> $(readlink "$_file" 2>/dev/null || echo '?') (skipped) ====="
+        echo
+        echo
+        return
+    fi
+
+    echo "===== File: $_file ====="
+
+    if [ "$(basename "$_file")" = ".gitignore" ]; then
+        echo "[.gitignore file contents skipped]"
+        _STAT_FILES=$(( _STAT_FILES + 1 ))
+    elif [ ! -r "$_file" ]; then
+        echo "[Error: file not readable]"
+        _STAT_FILES=$(( _STAT_FILES + 1 ))
+    elif is_binary "$_file"; then
+        echo "[Binary file skipped]"
+        _STAT_BINARY=$(( _STAT_BINARY + 1 ))
+    else
+        cat "$_file" || echo "[Error: could not read file]"
+        _STAT_FILES=$(( _STAT_FILES + 1 ))
+    fi
+    echo
+    echo
+}
+
+# print_contents uses a temp file to collect find output, then reads it with a
+# plain while loop (no pipe → runs in the current shell, so set -e and stat
+# counter updates propagate correctly).
+# Entries are sorted for stable, diffable output regardless of filesystem order.
+print_contents() {
+    local _dir _tmp_entries _tmp_sorted item
+    _dir="$1"
+    _tmp_entries="$(make_temp)"
+
+    find "$_dir" -maxdepth 1 \( -name "." -o -name ".." \) -prune -o -print \
+        > "$_tmp_entries" 2>/dev/null || true
+
+    # Sort for deterministic output
+    _tmp_sorted="$(make_temp)"
+    sort < "$_tmp_entries" > "$_tmp_sorted"
+    rm -f "$_tmp_entries"
+
+    while IFS= read -r item; do
+        [ "$item" = "$_dir" ] && continue
+
+        case "$item" in */.git) continue ;; esac
+
+        if [ -d "$item" ] && [ ! -L "$item" ]; then
+            is_ignored "$item" && continue
+            print_contents "$item"
+        elif [ -f "$item" ]; then
+            append_file "$item"
+        fi
+    done < "$_tmp_sorted"
+
+    rm -f "$_tmp_sorted"
+}
+
+# -------- Tree display (ignore-aware) --------
+
+# Portable tree fallback. Entries are sorted so the tree matches the stable
+# order used by print_contents.
+_print_tree_recursive() {
+    # local is not strictly POSIX but is universally supported (bash, zsh, dash,
+    # busybox sh). Without it, recursive calls corrupt _idx, _total, _prefix, and
+    # the temp file variables in the parent call frame.
+    local _dir _prefix _tmp_children _tmp_filtered _tmp_sorted_tree
+    local _total _idx _child _name _connector _new_prefix
+    _dir="$1"
+    _prefix="$2"
+
+    # Collect non-ignored children into a temp file
+    _tmp_children="$(make_temp)"
+    find "$_dir" -maxdepth 1 \( -name "." -o -name ".." \) -prune -o -print \
+        > "$_tmp_children" 2>/dev/null || true
+
+    # Filter ignored entries, sort for stable output
+    _tmp_filtered="$(make_temp)"
+    while IFS= read -r _child; do
+        [ "$_child" = "$_dir" ] && continue
+        case "$_child" in */.git) continue ;; esac
+        is_ignored "$_child" && continue
+        printf '%s\n' "$_child" >> "$_tmp_filtered"
+    done < "$_tmp_children"
+    rm -f "$_tmp_children"
+
+    # Sort entries
+    _tmp_sorted_tree="$(make_temp)"
+    sort < "$_tmp_filtered" > "$_tmp_sorted_tree"
+    rm -f "$_tmp_filtered"
+
+    # Count entries so we can detect the last one
+    _total=$(wc -l < "$_tmp_sorted_tree" | tr -d ' ')
+    _idx=0
+
+    while IFS= read -r _child; do
+        _idx=$(( _idx + 1 ))
+        _name="$(basename "$_child")"
+
+        if [ "$_idx" -eq "$_total" ]; then
+            _connector="└── "
+            _new_prefix="${_prefix}    "
+        else
+            _connector="├── "
+            _new_prefix="${_prefix}│   "
+        fi
+
+        printf '%s%s%s\n' "$_prefix" "$_connector" "$_name"
+
+        if [ -d "$_child" ] && [ ! -L "$_child" ]; then
+            _print_tree_recursive "$_child" "$_new_prefix"
+        fi
+    done < "$_tmp_sorted_tree"
+
+    rm -f "$_tmp_sorted_tree"
+}
+
+print_tree() {
+    _root="$1"
+    (
+        cd "$_root" || return
+
+        # Only use system tree when no custom ignore flags are active — the
+        # external tree binary has no knowledge of --ignore, --no-ignore, or
+        # output-file self-exclusion, so its output would desync from contents.
+        if [ "$NO_IGNORE" -eq 0 ] && [ "$USE_CUSTOM" -eq 0 ]; then
+            if command -v tree >/dev/null 2>&1; then
+                if tree --help 2>&1 | grep -q -- --gitignore; then
+                    tree -a --gitignore -I ".git"
+                    return
+                fi
+            fi
+        fi
+
+        # Portable fallback — _print_tree_recursive is defined in the parent
+        # shell and inherited by this subshell in bash/zsh/dash/ash.
+        echo "."
+        _print_tree_recursive "$_root" ""
+    )
+}
+
+process_root() {
+    _root="$1"
+    [ -z "$_root" ] && return
+
+    echo
+    echo "################################################"
+    echo "# SECTION ROOT: $_root"
+    echo "################################################"
+    echo
+
+    if [ -f "$_root" ]; then
+        echo "===== File Contents ($_root) ====="
+        echo
+        append_file "$_root"
+        return
+    fi
+
+    echo "===== Directory Tree ($_root) ====="
+    print_tree "$_root"
+    echo
+
+    echo "===== File Contents ($_root) ====="
+    echo
+    print_contents "$_root"
+}
+
+generate_report() {
+    echo "===== snapcode Report ====="
+    echo "Generated: $(date)"
+    while IFS= read -r target; do
+        [ -z "$target" ] && continue
+        process_root "$target"
+    done < "$TMP_TARGETS"
+}
+
+print_stats() {
+    echo "Done! Snapshot saved to: $OUTPUT_FILE"
+    echo "  $(_total=$(( _STAT_FILES + _STAT_BINARY )); echo "$_total") file(s) processed — $_STAT_FILES included, $_STAT_BINARY skipped as binary"
+}
+
+# -------- Main --------
+if [ "$OUTPUT_FILE" = "-" ]; then
+    generate_report
+else
+    # Create temp file in the same directory as OUTPUT_FILE so that mv is a
+    # same-filesystem rename (atomic) rather than a cross-filesystem copy+delete.
+    _out_dir="$(dirname "$OUTPUT_FILE")"
+    TMP_OUTPUT="$(mktemp "$_out_dir/.snapcode.tmp.XXXXXX" 2>/dev/null)" \
+        || TMP_OUTPUT="$(make_temp)"
+    generate_report > "$TMP_OUTPUT"
+    mv "$TMP_OUTPUT" "$OUTPUT_FILE"
+    TMP_OUTPUT=""   # already moved; don't delete in cleanup
+    print_stats
+fi
